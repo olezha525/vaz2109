@@ -2036,6 +2036,9 @@ window.VAZ = window.VAZ || {};
 /* =====================================================================
    ВАЗ-2109 — звук. Всё синтезируется через Web Audio API, файлов нет.
    Мотор: 4 цилиндра, 4 такта → 2 вспышки за оборот.
+   Новый вариант: два сгенерированных «сэмпл-лупа» (холостой и под
+   нагрузкой) + физическая модель вспышек, впуска, клапанов и выхлопа.
+   Стартер: соленоид, моторчик с шестернёй, прокрутка и «схватывание».
    ===================================================================== */
 (function () {
   'use strict';
@@ -2043,6 +2046,11 @@ window.VAZ = window.VAZ || {};
 
   const IDLE_RPM = 880;
   const MAX_RPM = 6800;
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const smoothstep = (a, b, x) => {
+    const t = clamp((x - a) / (b - a), 0, 1);
+    return t * t * (3 - 2 * t);
+  };
 
   class EngineAudio {
     constructor() {
@@ -2052,12 +2060,11 @@ window.VAZ = window.VAZ || {};
       this.master = null;
       this.running = false;
       this.starter = false;
-      this.stallTimer = 0;
       this.last = { rpm: IDLE_RPM, throttle: 0, load: 0, speed: 0, slip: 0 };
       this.hornOn = false;
       this.noiseBuf = null;
       this.nodes = {};
-      this._pendingStart = 0;
+      this.popAt = 0;
     }
 
     /* -------------------------------------------------------------- init */
@@ -2075,67 +2082,77 @@ window.VAZ = window.VAZ || {};
       const master = ctx.createGain();
       master.gain.value = 0;
       const comp = ctx.createDynamicsCompressor();
-      comp.threshold.value = -18;
-      comp.knee.value = 22;
-      comp.ratio.value = 3.2;
+      comp.threshold.value = -20;
+      comp.knee.value = 24;
+      comp.ratio.value = 3.4;
       comp.attack.value = 0.004;
-      comp.release.value = 0.22;
+      comp.release.value = 0.24;
       master.connect(comp);
       comp.connect(ctx.destination);
       this.master = master;
 
       this.noiseBuf = this._makeNoise(2.4);
 
-      /* --- выхлоп: пила на частоте вспышек + суб + расстройка --- */
-      const exhaustBus = ctx.createGain();
-      exhaustBus.gain.value = 0;
+      /* --- мотор: два лупа + выхлопная цепочка --- */
+      const engineGain = ctx.createGain();
+      engineGain.gain.value = 0;
+      engineGain.connect(master);
+
+      const engineBus = ctx.createGain();
+      engineBus.gain.value = 1;
 
       const shaper = ctx.createWaveShaper();
-      shaper.curve = this._makeCurve(2.6);
+      shaper.curve = this._makeCurve(2.4);
       shaper.oversample = '2x';
-
-      const lp = ctx.createBiquadFilter();
-      lp.type = 'lowpass';
-      lp.frequency.value = 420;
-      lp.Q.value = 1.1;
-
-      const lp2 = ctx.createBiquadFilter();
-      lp2.type = 'lowpass';
-      lp2.frequency.value = 2400;
-      lp2.Q.value = 0.4;
 
       const body = ctx.createBiquadFilter();
       body.type = 'peaking';
-      body.frequency.value = 165;
+      body.frequency.value = 105;
       body.Q.value = 0.9;
-      body.gain.value = 7;
+      body.gain.value = 6;
 
-      exhaustBus.connect(shaper);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass';
+      lp.frequency.value = 520;
+      lp.Q.value = 0.9;
+
+      const lp2 = ctx.createBiquadFilter();
+      lp2.type = 'lowpass';
+      lp2.frequency.value = 2800;
+      lp2.Q.value = 0.4;
+
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass';
+      hp.frequency.value = 28;
+      hp.Q.value = 0.6;
+
+      engineBus.connect(shaper);
       shaper.connect(body);
       body.connect(lp);
       lp.connect(lp2);
-      lp2.connect(master);
+      lp2.connect(hp);
+      hp.connect(engineGain);
 
-      const o1 = ctx.createOscillator();
-      o1.type = 'sawtooth';
-      const g1 = ctx.createGain();
-      g1.gain.value = 0.55;
-      o1.connect(g1);
-      g1.connect(exhaustBus);
+      const lowBuf = this._makeEngineLoop(850, 0.85, false);
+      const highBuf = this._makeEngineLoop(3200, 0.75, true);
 
-      const o2 = ctx.createOscillator();
-      o2.type = 'square';
-      const g2 = ctx.createGain();
-      g2.gain.value = 0.3;
-      o2.connect(g2);
-      g2.connect(exhaustBus);
+      const lowSrc = ctx.createBufferSource();
+      lowSrc.buffer = lowBuf;
+      lowSrc.loop = true;
+      const highSrc = ctx.createBufferSource();
+      highSrc.buffer = highBuf;
+      highSrc.loop = true;
 
-      const o3 = ctx.createOscillator();
-      o3.type = 'sawtooth';
-      const g3 = ctx.createGain();
-      g3.gain.value = 0.16;
-      o3.connect(g3);
-      g3.connect(exhaustBus);
+      const lowGain = ctx.createGain();
+      lowGain.gain.value = 0.95;
+      const highGain = ctx.createGain();
+      highGain.gain.value = 0;
+
+      lowSrc.connect(lowGain);
+      highGain.gain.value = 0;
+      highSrc.connect(highGain);
+      lowGain.connect(engineBus);
+      highGain.connect(engineBus);
 
       /* --- впуск: шум, открывается по газу --- */
       const intakeSrc = ctx.createBufferSource();
@@ -2144,7 +2161,7 @@ window.VAZ = window.VAZ || {};
       const intakeBp = ctx.createBiquadFilter();
       intakeBp.type = 'bandpass';
       intakeBp.frequency.value = 900;
-      intakeBp.Q.value = 1.4;
+      intakeBp.Q.value = 1.2;
       const intakeGain = ctx.createGain();
       intakeGain.gain.value = 0;
       intakeSrc.connect(intakeBp);
@@ -2157,37 +2174,55 @@ window.VAZ = window.VAZ || {};
       mechSrc.loop = true;
       const mechHp = ctx.createBiquadFilter();
       mechHp.type = 'highpass';
-      mechHp.frequency.value = 2600;
+      mechHp.frequency.value = 2400;
       const mechGain = ctx.createGain();
       mechGain.gain.value = 0;
       mechSrc.connect(mechHp);
       mechHp.connect(mechGain);
       mechGain.connect(master);
 
-      /* --- стартер --- */
-      const starterOsc = ctx.createOscillator();
-      starterOsc.type = 'sawtooth';
-      starterOsc.frequency.value = 165;
-      const starterBp = ctx.createBiquadFilter();
-      starterBp.type = 'bandpass';
-      starterBp.frequency.value = 720;
-      starterBp.Q.value = 2.2;
-      const starterGain = ctx.createGain();
-      starterGain.gain.value = 0;
+      /* --- стартер: соленоид, моторчик, шестерня, прокрутка --- */
+      const starterBus = ctx.createGain();
+      starterBus.gain.value = 0;
+      starterBus.connect(master);
+
       const starterTrem = ctx.createGain();
       starterTrem.gain.value = 0.7;
-      starterOsc.connect(starterBp);
-      starterBp.connect(starterGain);
-      starterGain.connect(starterTrem);
-      starterTrem.connect(master);
+      starterTrem.connect(starterBus);
 
-      const starterLfo = ctx.createOscillator();
-      starterLfo.type = 'square';
-      starterLfo.frequency.value = 11.5;
-      const starterLfoGain = ctx.createGain();
-      starterLfoGain.gain.value = 0.28;
-      starterLfo.connect(starterLfoGain);
-      starterLfoGain.connect(starterTrem.gain);
+      const smOsc = ctx.createOscillator();
+      smOsc.type = 'sawtooth';
+      smOsc.frequency.value = 980;
+      const smBp = ctx.createBiquadFilter();
+      smBp.type = 'bandpass';
+      smBp.frequency.value = 1350;
+      smBp.Q.value = 5.5;
+      const smGain = ctx.createGain();
+      smGain.gain.value = 0.4;
+      smOsc.connect(smBp);
+      smBp.connect(smGain);
+      smGain.connect(starterTrem);
+
+      const sgOsc = ctx.createOscillator();
+      sgOsc.type = 'sawtooth';
+      sgOsc.frequency.value = 96;
+      const sgLp = ctx.createBiquadFilter();
+      sgLp.type = 'lowpass';
+      sgLp.frequency.value = 430;
+      sgLp.Q.value = 1.2;
+      const sgGain = ctx.createGain();
+      sgGain.gain.value = 0.38;
+      sgOsc.connect(sgLp);
+      sgLp.connect(sgGain);
+      sgGain.connect(starterTrem);
+
+      const crankLfo = ctx.createOscillator();
+      crankLfo.type = 'square';
+      crankLfo.frequency.value = 9;
+      const crankGain = ctx.createGain();
+      crankGain.gain.value = 0.3;
+      crankLfo.connect(crankGain);
+      crankGain.connect(starterTrem.gain);
 
       /* --- шины: визг при сносе --- */
       const tyreSrc = ctx.createBufferSource();
@@ -2233,15 +2268,24 @@ window.VAZ = window.VAZ || {};
       hornBp.connect(hornGain);
       hornGain.connect(master);
 
-      o1.start(); o2.start(); o3.start();
-      intakeSrc.start(); mechSrc.start(); tyreSrc.start(); windSrc.start();
-      starterOsc.start(); starterLfo.start();
-      hornOsc1.start(); hornOsc2.start();
+      lowSrc.start();
+      highSrc.start();
+      intakeSrc.start();
+      mechSrc.start();
+      tyreSrc.start();
+      windSrc.start();
+      smOsc.start();
+      sgOsc.start();
+      crankLfo.start();
+      hornOsc1.start();
+      hornOsc2.start();
 
       this.nodes = {
-        exhaustBus, shaper, lp, lp2, body,
-        o1, o2, o3, g1, g2, g3,
-        intakeGain, intakeBp, mechGain, starterGain, starterOsc,
+        engineGain, engineBus, lowSrc, highSrc, lowGain, highGain,
+        shaper, body, lp, lp2, hp,
+        intakeGain, intakeBp, mechGain,
+        starterBus, starterGain: starterBus, starterOsc: smOsc, starterGrowl: sgOsc,
+        starterTrem, crankLfo, smBp, sgLp,
         tyreGain, tyreBp, windGain, windLp, hornGain,
       };
       this.ready = true;
@@ -2279,6 +2323,90 @@ window.VAZ = window.VAZ || {};
       return curve;
     }
 
+    /* --------------------------------------------------- engine sample loop
+       Генерируем один период работы мотора как «запись»: вспышки четырёх
+       цилиндров, впуск, клапаны, шум и резонанс выхлопа. Два лупа — для
+       холостых и для нагрузки; между ними плавный кроссфейд по оборотам.
+       ---------------------------------------------------------------- */
+    _makeEngineLoop(rpm, seconds, hot) {
+      const sr = this.ctx.sampleRate;
+      const fire = (rpm / 60) * 2;
+      const cycle = 1 / fire;
+      const cycles = Math.max(6, Math.round(seconds * fire));
+      const n = Math.max(1024, Math.round(cycles * cycle * sr));
+      const fade = Math.min(Math.floor(sr * 0.02), Math.floor(n * 0.12));
+      const total = n + fade;
+      const raw = new Float32Array(total);
+
+      const off = hot ? [0.0, 0.025, 0.5, 0.525] : [0.0, 0.07, 0.5, 0.57];
+      const amp = hot ? [1.0, 0.93, 1.0, 0.96] : [0.95, 0.84, 1.0, 0.88];
+
+      const fc = 70 + rpm * 0.05;
+      const f = 2 * Math.sin(Math.PI * Math.min(fc, sr * 0.4) / sr);
+      const q = 0.82;
+      let lpState = 0;
+      let bpState = 0;
+
+      for (let i = 0; i < total; i++) {
+        const t = i / sr;
+        const ph = ((i / n) * cycles) % 1;
+        let ex = 0;
+        let intake = 0;
+        let mech = 0;
+
+        for (let k = 0; k < 4; k++) {
+          let dt = ph - (k * 0.25 + off[k]);
+          dt -= Math.floor(dt);
+          const tp = dt * cycle;
+          if (tp < cycle * 0.95) {
+            const attack = 1 - Math.exp(-tp / 0.0014);
+            const decay = Math.exp(-tp / (hot ? 0.009 : 0.015));
+            ex += amp[k] * attack * decay;
+          }
+
+          let di = ph - (k * 0.25 + 0.5);
+          di -= Math.floor(di);
+          const ti = di * cycle;
+          if (ti < cycle * 0.6) {
+            intake += 0.4 * (1 - Math.exp(-ti / 0.001)) * Math.exp(-ti / 0.006);
+          }
+        }
+
+        // клапанный шелест — четыре раза за цикл
+        const vt = (ph * 4) % 1;
+        if (vt < 0.04) {
+          mech += 0.05 * Math.sin(2 * Math.PI * 3100 * t) * Math.exp((-vt * cycle) / 0.0012);
+        }
+
+        const noise = (Math.random() * 2 - 1) * (hot ? 0.05 : 0.035);
+
+        // резонанс выхлопа (state-variable filter)
+        lpState += f * bpState;
+        const high = ex - lpState - q * bpState;
+        bpState += f * high;
+
+        const s = lpState * 1.1 + bpState * 0.85 + intake * 0.55 + mech + noise;
+        raw[i] = Math.tanh(s * 1.6);
+      }
+
+      // бесшовный луп: начало подмешиваем к «хвосту» следующего цикла
+      const out = new Float32Array(n);
+      for (let i = 0; i < n; i++) out[i] = raw[i];
+      for (let i = 0; i < fade; i++) {
+        const a = i / fade;
+        out[i] = raw[i] * a + raw[n + i] * (1 - a);
+      }
+
+      let peak = 0.0001;
+      for (let i = 0; i < n; i++) peak = Math.max(peak, Math.abs(out[i]));
+      const g = 0.92 / peak;
+      for (let i = 0; i < n; i++) out[i] *= g;
+
+      const buf = this.ctx.createBuffer(1, n, sr);
+      buf.getChannelData(0).set(out);
+      return buf;
+    }
+
     /* ------------------------------------------------------------- params */
 
     setMuted(m) {
@@ -2290,17 +2418,22 @@ window.VAZ = window.VAZ || {};
     setRpm(rpm, tau = 0.06) {
       if (!this.ready) return;
       const t = this.ctx.currentTime;
-      const f = Math.max(12, (rpm / 60) * 2);
-      this.nodes.o1.frequency.setTargetAtTime(f, t, tau);
-      this.nodes.o2.frequency.setTargetAtTime(f * 0.5, t, tau);
-      this.nodes.o3.frequency.setTargetAtTime(f * 2.008, t, tau);
+      const n = this.nodes;
+      const r = clamp(rpm, 500, MAX_RPM);
+      const lowRate = clamp(r / 850, 0.85, 2.8);
+      const highRate = clamp(r / 3200, 0.75, 2.2);
+      n.lowSrc.playbackRate.setTargetAtTime(lowRate, t, tau);
+      n.highSrc.playbackRate.setTargetAtTime(highRate, t, tau);
+      const blend = smoothstep(1700, 2900, r);
+      n.lowGain.gain.setTargetAtTime((1 - blend) * 0.95, t, tau);
+      n.highGain.gain.setTargetAtTime(blend * 0.9, t, tau);
     }
 
-    setRunning(on, rpmNow) {
+    setRunning(on) {
       if (!this.ready) return;
       this.running = on;
       const t = this.ctx.currentTime;
-      this.nodes.exhaustBus.gain.setTargetAtTime(on ? 0.5 : 0, t, on ? 0.09 : 0.18);
+      this.nodes.engineGain.gain.setTargetAtTime(on ? 0.55 : 0, t, on ? 0.1 : 0.18);
       if (!on) {
         this.nodes.intakeGain.gain.setTargetAtTime(0, t, 0.15);
         this.nodes.mechGain.gain.setTargetAtTime(0, t, 0.15);
@@ -2311,8 +2444,16 @@ window.VAZ = window.VAZ || {};
       if (!this.ready) return;
       this.starter = on;
       const t = this.ctx.currentTime;
-      this.nodes.starterGain.gain.setTargetAtTime(on ? 0.32 : 0, t, on ? 0.04 : 0.1);
-      this.nodes.starterOsc.frequency.setTargetAtTime(on ? 150 : 120, t, 0.1);
+      const n = this.nodes;
+      n.starterGain.gain.setTargetAtTime(on ? 0.5 : 0, t, on ? 0.035 : 0.09);
+      n.starterOsc.frequency.setTargetAtTime(on ? 1050 : 880, t, 0.12);
+      n.starterGrowl.frequency.setTargetAtTime(on ? 100 : 88, t, 0.12);
+      n.crankLfo.frequency.setTargetAtTime(on ? 9 : 7, t, 0.15);
+      if (on) {
+        // соленоид и удар бендикса
+        this._noiseBurst(0.05, 2500, 2.2, 0.11, 'highpass');
+        this._tone(90, 0.07, 0.13, 'square');
+      }
     }
 
     /* ---------------------------------------------------------- per frame */
@@ -2327,30 +2468,32 @@ window.VAZ = window.VAZ || {};
       // «рваный» холостой ход карбюратора
       let rpm = st.rpm;
       if (running && rpm < 1200) {
-        rpm += Math.sin(t * 11.3) * 9 + Math.sin(t * 27.1) * 4;
+        rpm += Math.sin(t * 11.3) * 10 + Math.sin(t * 27.1) * 4;
       }
       this.setRpm(rpm, 0.045);
 
-      const load = U.clamp(st.throttle, 0, 1);
-      const cut = 300 + rpm * 0.34 + load * 1500;
-      n.lp.frequency.setTargetAtTime(cut, t, 0.06);
+      const load = clamp(st.throttle, 0, 1);
+      n.lp.frequency.setTargetAtTime(300 + rpm * 0.3 + load * 1700, t, 0.06);
       n.lp2.frequency.setTargetAtTime(1400 + rpm * 0.55 + load * 2600, t, 0.08);
-      n.body.gain.setTargetAtTime(5 + load * 8, t, 0.1);
+      n.body.gain.setTargetAtTime(5 + load * 9, t, 0.1);
 
-      const ex = running ? 0.3 + load * 0.34 + U.clamp(rpm / MAX_RPM, 0, 1) * 0.16 : 0;
-      n.exhaustBus.gain.setTargetAtTime(ex, t, 0.05);
-
-      n.intakeGain.gain.setTargetAtTime(running ? load * 0.055 + 0.004 : 0, t, 0.08);
+      n.intakeGain.gain.setTargetAtTime(running ? load * 0.06 + 0.004 : 0, t, 0.08);
       n.intakeBp.frequency.setTargetAtTime(700 + rpm * 0.22, t, 0.1);
-      n.mechGain.gain.setTargetAtTime(running ? 0.006 + (rpm / MAX_RPM) * 0.03 : 0, t, 0.1);
+      n.mechGain.gain.setTargetAtTime(running ? 0.005 + (rpm / MAX_RPM) * 0.03 : 0, t, 0.1);
+
+      // «стрельба» в выхлоп при сбросе газа
+      if (running && load < 0.04 && rpm > 2500 && t > this.popAt && Math.random() < 0.06) {
+        this.popAt = t + 0.22;
+        this._exhaustPop();
+      }
 
       // визг шин
-      const slip = U.clamp(st.slip, 0, 1);
+      const slip = clamp(st.slip, 0, 1);
       n.tyreGain.gain.setTargetAtTime(slip * 0.085, t, 0.05);
       n.tyreBp.frequency.setTargetAtTime(1500 + slip * 900, t, 0.1);
 
       // ветер
-      const sp = U.clamp(st.speed / 55, 0, 1.4);
+      const sp = clamp(st.speed / 55, 0, 1.4);
       n.windGain.gain.setTargetAtTime(Math.min(0.11, sp * sp * 0.12), t, 0.12);
       n.windLp.frequency.setTargetAtTime(400 + sp * 900, t, 0.15);
 
@@ -2408,9 +2551,14 @@ window.VAZ = window.VAZ || {};
       o.onended = () => { try { g.disconnect(); } catch (e) {} };
     }
 
+    _exhaustPop() {
+      this._noiseBurst(0.1, 170, 0.9, 0.16, 'lowpass', 70);
+      this._tone(52, 0.09, 0.09, 'sine', 32);
+    }
+
     crash(intensity) {
       if (!this.ready) return;
-      const k = U.clamp(intensity, 0.05, 1);
+      const k = clamp(intensity, 0.05, 1);
       this._noiseBurst(0.16 + k * 0.28, 900 + Math.random() * 700, 1.1, 0.18 + k * 0.3, 'bandpass', 180);
       this._tone(90 + k * 40, 0.22 + k * 0.2, 0.22 + k * 0.28, 'sine', 40);
       this._noiseBurst(0.09, 3200, 3, 0.1 * k, 'highpass');
@@ -2437,15 +2585,24 @@ window.VAZ = window.VAZ || {};
       const ctx = this.ctx;
       const t = ctx.currentTime;
       const n = this.nodes;
-      n.exhaustBus.gain.cancelScheduledValues(t);
-      n.exhaustBus.gain.setValueAtTime(0.02, t);
-      n.exhaustBus.gain.linearRampToValueAtTime(0.62, t + 0.09);
-      n.exhaustBus.gain.setTargetAtTime(0.42, t + 0.5, 0.3);
-      this._noiseBurst(0.2, 600, 1.2, 0.16, 'bandpass', 220);
+      n.starterGain.gain.cancelScheduledValues(t);
+      n.starterGain.gain.setTargetAtTime(0, t, 0.03);
+      n.engineGain.gain.cancelScheduledValues(t);
+      n.engineGain.gain.setValueAtTime(0.04, t);
+      n.engineGain.gain.linearRampToValueAtTime(0.68, t + 0.08);
+      n.engineGain.gain.setTargetAtTime(0.55, t + 0.4, 0.3);
+      // вспышка, хлопок и короткий визг ремня
+      this._noiseBurst(0.18, 480, 1.0, 0.2, 'lowpass', 170);
+      this._tone(62, 0.3, 0.2, 'sine', 36);
+      this._noiseBurst(0.06, 3000, 3, 0.07, 'highpass');
+      this._tone(2300, 0.12, 0.025, 'triangle', 2600);
     }
 
     stall() {
       if (!this.ready) return;
+      const t = this.ctx.currentTime;
+      this.nodes.engineGain.gain.cancelScheduledValues(t);
+      this.nodes.engineGain.gain.setTargetAtTime(0, t, 0.1);
       this._noiseBurst(0.35, 300, 1, 0.12, 'lowpass', 90);
       this._tone(60, 0.4, 0.12, 'sine', 28);
     }
