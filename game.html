@@ -2677,6 +2677,11 @@ window.VAZ = window.VAZ || {};
     '#5a5f66', '#7a3d55', '#3f6d64', '#b06a2c', '#d6d2c4', '#2b2f36',
   ];
 
+  const PED_COLORS = [
+    '#b8563f', '#3f5f86', '#6f7a4a', '#8a3f4f', '#4f4f57', '#c9a35a',
+    '#5f7a5a', '#7a4f6a', '#a06a3f', '#3f6f6a', '#8a6a4a', '#5a4f7a',
+  ];
+
   /* ------------------------------------------------------------ утилиты */
 
   const seeded = (gi, gj) => Math.floor(hash(gi * 127.13 + gj * 311.71 + 4.37) * 1e9);
@@ -2737,6 +2742,20 @@ window.VAZ = window.VAZ || {};
       city.roads.push({ pts, width: ROAD_W.street, type: 'street', loop: false, city });
     }
     city.spokeAngles = spokeAngles;
+
+    /* --- светофоры на выезде спиц к кольцу --- */
+    city.lights = [];
+    for (let s = 0; s < spokes; s++) {
+      const a = spokeAngles[s];
+      city.lights.push({
+        x: x + Math.cos(a) * r,
+        y: y + Math.sin(a) * r,
+        a,
+        phase: rng() * 18,
+        ring: 'green',
+        spoke: 'red',
+      });
+    }
 
     /* --- кварталы: кольца домов между радиусами --- */
     const sectors = spokes;
@@ -2811,6 +2830,30 @@ window.VAZ = window.VAZ || {};
     for (let i = 0; i < 4; i++) {
       const a = rot + (i / 4) * TAU;
       city.exits.push({ a, x: x + Math.cos(a) * r, y: y + Math.sin(a) * r });
+    }
+
+    /* --- пешеходы на тротуарах --- */
+    city.peds = [];
+    const pedCount = 10 + spokes * 3;
+    for (let i = 0; i < pedCount; i++) {
+      const onRing = rng() < 0.55;
+      const road = onRing ? city.roads[0] : city.roads[2 + (i % spokes)];
+      const total = polylineLength(road.pts);
+      const p = {
+        road,
+        s: rng() * total,
+        side: rng() < 0.5 ? -1 : 1,
+        dir: rng() < 0.5 ? -1 : 1,
+        speed: 0.9 + rng() * 0.7,
+        walk: rng() * 10,
+        color: pick(PED_COLORS),
+        city,
+        scared: 0,
+        x: 0,
+        y: 0,
+      };
+      pedPlace(p);
+      city.peds.push(p);
     }
 
     return city;
@@ -2906,6 +2949,14 @@ window.VAZ = window.VAZ || {};
     return { x: pts[0][0], y: pts[0][1], h: 0, total };
   }
 
+  function pedPlace(p) {
+    const pos = pointOnPolyline(p.road.pts, p.s, p.road.loop);
+    const off = p.road.width * 0.5 + 3.2 + p.scared * 1.2;
+    p.x = pos.x - Math.sin(pos.h) * off * p.side;
+    p.y = pos.y + Math.cos(pos.h) * off * p.side;
+    p.h = pos.h + (p.dir < 0 ? Math.PI : 0);
+  }
+
   function distToPolyline(x, y, pts) {    let best = Infinity;
     for (let i = 0; i < pts.length - 1; i++) {
       const ax = pts[i][0], ay = pts[i][1];
@@ -2982,6 +3033,9 @@ window.VAZ = window.VAZ || {};
       this.nearBuildings = [];
       this.nearProps = [];
       this.nearCities = [];
+      this.lights = [];
+      this.pedestrians = [];
+      this.time = 0;
       this._refreshTimer = 0;
       this.visited = new Set();
       this.maxTraffic = 26;
@@ -3040,6 +3094,23 @@ window.VAZ = window.VAZ || {};
       }
       this.nearBuildings = buildings;
       this.nearProps = props;
+
+      const lights = [];
+      for (const c of this.cities) {
+        if (Math.hypot(c.x - x, c.y - y) > 1100) continue;
+        for (const l of c.lights) lights.push(l);
+      }
+      this.lights = lights;
+
+      const peds = [];
+      for (const c of this.cities) {
+        if (Math.hypot(c.x - x, c.y - y) > 750) continue;
+        for (const p of c.peds) {
+          pedPlace(p);
+          if (Math.hypot(p.x - x, p.y - y) < 560) peds.push(p);
+        }
+      }
+      this.pedestrians = peds;
     }
 
     cityAtPoint(x, y) {
@@ -3147,6 +3218,19 @@ window.VAZ = window.VAZ || {};
           }
         }
         c.avoid = U.damp(c.avoid, avoidTarget, 1.8, dt);
+        // светофор: красный — стоим перед пересечением
+        for (const l of this.lights) {
+          const lx = l.x - pos.x, ly = l.y - pos.y;
+          const ahead = lx * hx + ly * hy;
+          if (ahead < 2 || ahead > 20) continue;
+          const lat = Math.abs(lx * -hy + ly * hx);
+          if (lat > c.road.width * 0.85) continue;
+          const state = c.road.type === 'ring' ? l.ring : c.road.type === 'street' ? l.spoke : 'green';
+          if (state === 'red' || (state === 'yellow' && ahead < 11)) {
+            target = 0;
+            break;
+          }
+        }
         // если прижались к борту — возвращаемся плавнее
         c.speed = U.damp(c.speed, target, target < c.speed ? 2.4 : 0.9, dt);
         c.s += c.speed * dt;
@@ -3165,9 +3249,54 @@ window.VAZ = window.VAZ || {};
       }
     }
 
+    /* ---------------------------------------------------------- светофоры */
+
+    updateLights() {
+      const CYCLE = 22;
+      const GREEN = 9;
+      const YELLOW = 2.5;
+      for (const l of this.lights) {
+        const p = (this.time + l.phase) % CYCLE;
+        l.ring = p < GREEN ? 'green' : p < GREEN + YELLOW ? 'yellow' : 'red';
+        l.spoke = p >= GREEN + YELLOW && p < GREEN + YELLOW + GREEN
+          ? 'green'
+          : p >= GREEN + YELLOW + GREEN && p < CYCLE ? 'yellow' : 'red';
+      }
+    }
+
+    /* --------------------------------------------------------- пешеходы */
+
+    updatePedestrians(dt, px, py) {
+      for (const p of this.pedestrians) {
+        if (p.scared > 0) p.scared -= dt;
+        const slow = p.scared > 0 ? 0.25 : 1;
+        p.s += p.dir * p.speed * slow * dt;
+        const total = polylineLength(p.road.pts);
+        if (p.road.loop) {
+          p.s = ((p.s % total) + total) % total;
+        } else if (p.s < 0 || p.s > total) {
+          p.dir *= -1;
+          p.s = clamp(p.s, 0, total);
+        }
+        p.walk += p.speed * slow * dt * 4;
+        pedPlace(p);
+        const d = Math.hypot(p.x - px, p.y - py);
+        if (d < 2.4) {
+          p.scared = 1.8;
+          const nx = (p.x - px) / (d || 1);
+          const ny = (p.y - py) / (d || 1);
+          p.x += nx * 1.2;
+          p.y += ny * 1.2;
+        }
+      }
+    }
+
     update(dt, px, py, playerSpeed = 0) {
+      this.time += dt;
+      this.updateLights();
       this.refresh(px, py);
       this.updateTraffic(dt, px, py, playerSpeed);
+      this.updatePedestrians(dt, px, py);
       this.trafficTimer -= dt;
       if (this.trafficTimer <= 0) {
         this.trafficTimer = 0.16;
@@ -3277,6 +3406,27 @@ window.VAZ = window.VAZ || {};
           car.vx *= 0.9;
           car.vy *= 0.9;
         }
+      }
+      return hit;
+    }
+    resolvePedestrians(car) {
+      let hit = 0;
+      for (const p of this.pedestrians) {
+        const dx = p.x - car.x, dy = p.y - car.y;
+        const d = Math.hypot(dx, dy);
+        if (d > 2.7) continue;
+        const nx = dx / (d || 1), ny = dy / (d || 1);
+        p.x += nx * 1.5;
+        p.y += ny * 1.5;
+        p.scared = 2.2;
+        const vn = car.vx * nx + car.vy * ny;
+        if (vn < 0) {
+          car.vx -= vn * nx * 0.7;
+          car.vy -= vn * ny * 0.7;
+          hit = Math.max(hit, -vn);
+        }
+        car.vx *= 0.94;
+        car.vy *= 0.94;
       }
       return hit;
     }
@@ -3439,6 +3589,8 @@ window.VAZ = window.VAZ || {};
       this._drawGas(ctx, st.world, view, st.time);
       this._drawBuildings(ctx, st.world, view, visible, st.time);
       this._drawProps(ctx, st.world, view, visible);
+      this._drawTrafficLights(ctx, st.world, view);
+      this._drawPedestrians(ctx, st.world, view);
       this._drawTraffic(ctx, st.world, view, st, visible);
       this._drawCar(ctx, st.car, st);
       this._drawParticles(ctx, st.world, view);
@@ -3740,6 +3892,59 @@ window.VAZ = window.VAZ || {};
           ctx.arc(p.x, p.y, r * 0.8, 0, TAU);
           ctx.fill();
         }
+      }
+    }
+
+    /* -------------------------------------------------------------- light */
+
+    _drawTrafficLights(ctx, world, view) {
+      const col = { red: '#ff3a2f', yellow: '#ffc23c', green: '#59e07a' };
+      for (const l of world.lights) {
+        if (l.x < view.x0 - 14 || l.x > view.x1 + 14 || l.y < view.y0 - 14 || l.y > view.y1 + 14) continue;
+        ctx.save();
+        ctx.translate(l.x, l.y);
+        ctx.rotate(l.a);
+        ctx.fillStyle = '#3a4148';
+        ctx.beginPath();
+        ctx.arc(8.5, 0, 0.55, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = '#3a4148';
+        ctx.lineWidth = 0.3;
+        ctx.beginPath();
+        ctx.moveTo(8.5, 0);
+        ctx.lineTo(4.8, 0);
+        ctx.stroke();
+        ctx.fillStyle = '#101418';
+        ctx.fillRect(4.4, -0.55, 1.3, 1.1);
+        ctx.fillStyle = col[l.spoke] || '#2a2f35';
+        ctx.beginPath();
+        ctx.arc(5.05, 0, 0.34, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = col[l.ring] || '#2a2f35';
+        ctx.beginPath();
+        ctx.arc(5.05, 0.55, 0.22, 0, TAU);
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    _drawPedestrians(ctx, world, view) {
+      for (const p of world.pedestrians) {
+        if (p.x < view.x0 - 6 || p.x > view.x1 + 6 || p.y < view.y0 - 6 || p.y > view.y1 + 6) continue;
+        ctx.fillStyle = 'rgba(6,8,10,0.25)';
+        ctx.beginPath();
+        ctx.arc(p.x + 0.3, p.y + 0.35, 0.45, 0, TAU);
+        ctx.fill();
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 0.4, 0, TAU);
+        ctx.fill();
+        ctx.strokeStyle = 'rgba(20,24,28,0.6)';
+        ctx.lineWidth = 0.12;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + Math.cos(p.h || 0) * 0.9, p.y + Math.sin(p.h || 0) * 0.9);
+        ctx.stroke();
       }
     }
 
@@ -4693,11 +4898,23 @@ window.VAZ = window.VAZ || {};
         if (d < 5 || d > 220) continue;
         items.push({ z: d, type: 'c', c: t });
       }
+      for (const l of st.world.lights) {
+        const d = Math.hypot(l.x - cam.x, l.y - cam.z);
+        if (d > 220) continue;
+        items.push({ z: d, type: 'l', l });
+      }
+      for (const p of st.world.pedestrians) {
+        const d = Math.hypot(p.x - cam.x, p.y - cam.z);
+        if (d < 3 || d > 150) continue;
+        items.push({ z: d, type: 'ped', p });
+      }
       items.sort((a, b) => b.z - a.z);
 
       for (const it of items) {
         if (it.type === 'b') this._drawBuilding(ctx, it.b, night);
         else if (it.type === 'p') this._drawProp(ctx, it.p, night);
+        else if (it.type === 'l') this._drawTrafficLight(ctx, it.l, night);
+        else if (it.type === 'ped') this._drawPedestrian(ctx, it.p, night);
         else this._drawTrafficCar(ctx, it.c, night);
       }
     }
@@ -4883,6 +5100,122 @@ window.VAZ = window.VAZ || {};
       if (this.cam.h > h) {
         this._poly([[c[0].x, h, c[0].z], [c[1].x, h, c[1].z], [c[2].x, h, c[2].z], [c[3].x, h, c[3].z]], roof);
       }
+    }
+
+    /* ------------------------------------------------------- traffic lights */
+
+    _drawTrafficLight(ctx, l, night) {
+      const px = l.x + Math.cos(l.a) * 8.5;
+      const pz = l.y + Math.sin(l.a) * 8.5;
+      const base = this.project(px, 0, pz);
+      const top = this.project(px, 5.05, pz);
+      if (!base || !top) return;
+      const s = base.s;
+      ctx.strokeStyle = '#3d444c';
+      ctx.lineWidth = Math.max(1, 0.14 * s);
+      ctx.beginPath();
+      ctx.moveTo(base.x, base.y);
+      ctx.lineTo(top.x, top.y);
+      ctx.stroke();
+
+      const arm = this.project(px - Math.cos(l.a) * 3.4, 4.85, pz - Math.sin(l.a) * 3.4);
+      let hx = top.x, hy = top.y;
+      if (arm) {
+        ctx.lineWidth = Math.max(1, 0.1 * s);
+        ctx.beginPath();
+        ctx.moveTo(top.x, top.y);
+        ctx.lineTo(arm.x, arm.y);
+        ctx.stroke();
+        hx = arm.x;
+        hy = arm.y;
+      }
+      this._drawLightHead(ctx, hx, hy, s, l.spoke, night);
+      this._drawLightHead(ctx, top.x + 0.8 * s, top.y - 1.2 * s, s * 0.9, l.ring, night);
+    }
+
+    _drawLightHead(ctx, x, y, s, state, night) {
+      if (s < 1.2) return;
+      const w = Math.max(5, 0.62 * s);
+      const h = Math.max(9, 1.55 * s);
+      const x0 = x - w / 2;
+      const y0 = y - h;
+      ctx.fillStyle = '#101418';
+      ctx.fillRect(x0, y0, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x0 + 0.5, y0 + 0.5, w - 1, h - 1);
+      const col = { red: '#ff3a2f', yellow: '#ffc23c', green: '#59e07a' };
+      const dim = { red: '#3a1512', yellow: '#3a2d10', green: '#12351d' };
+      const order = ['red', 'yellow', 'green'];
+      for (let i = 0; i < 3; i++) {
+        const c = order[i];
+        const on = state === c;
+        if (on && night > 0.15) {
+          ctx.shadowColor = col[c];
+          ctx.shadowBlur = Math.min(16, 0.9 * s);
+        }
+        ctx.fillStyle = on ? col[c] : dim[c];
+        ctx.beginPath();
+        ctx.arc(x, y0 + h * (0.2 + i * 0.3), Math.max(1.4, w * 0.28), 0, TAU);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
+    }
+
+    _drawPedestrian(ctx, p, night) {
+      const q = this.project(p.x, 0, p.y);
+      if (!q) return;
+      const s = q.s;
+      if (s < 1.4) return;
+      const h = 1.72 * s;
+      if (h < 4) {
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(q.x, q.y - 1, Math.max(1, 0.2 * s), 0, TAU);
+        ctx.fill();
+        return;
+      }
+      const dark = night * 0.35;
+      const swing = Math.sin(p.walk) * 0.3;
+      const body = U.shade(p.color, -dark);
+      const pants = U.shade('#2c3238', -dark * 0.6);
+      const skin = U.shade('#c9a07a', -dark);
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      ctx.beginPath();
+      ctx.ellipse(q.x, q.y, 0.34 * s, 0.12 * s, 0, 0, TAU);
+      ctx.fill();
+      ctx.strokeStyle = pants;
+      ctx.lineWidth = Math.max(1, 0.11 * s);
+      ctx.lineCap = 'round';
+      const hipY = q.y - h * 0.46;
+      ctx.beginPath();
+      ctx.moveTo(q.x, hipY);
+      ctx.lineTo(q.x - swing * 0.4 * s, q.y);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(q.x, hipY);
+      ctx.lineTo(q.x + swing * 0.4 * s, q.y);
+      ctx.stroke();
+      ctx.fillStyle = body;
+      ctx.fillRect(q.x - 0.18 * s, q.y - h * 0.86, 0.36 * s, h * 0.4);
+      ctx.strokeStyle = body;
+      ctx.lineWidth = Math.max(1, 0.08 * s);
+      ctx.beginPath();
+      ctx.moveTo(q.x - 0.15 * s, q.y - h * 0.8);
+      ctx.lineTo(q.x - 0.3 * s - swing * 0.16 * s, q.y - h * 0.55);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(q.x + 0.15 * s, q.y - h * 0.8);
+      ctx.lineTo(q.x + 0.3 * s + swing * 0.16 * s, q.y - h * 0.55);
+      ctx.stroke();
+      ctx.fillStyle = skin;
+      ctx.beginPath();
+      ctx.arc(q.x, q.y - h * 0.92, Math.max(1.2, 0.14 * s), 0, TAU);
+      ctx.fill();
+      ctx.fillStyle = U.shade('#3a2a20', -dark);
+      ctx.beginPath();
+      ctx.arc(q.x, q.y - h * 0.95, Math.max(1.1, 0.14 * s), Math.PI, TAU);
+      ctx.fill();
     }
 
     /* --------------------------------------------------------------- traffic */
@@ -6233,7 +6566,12 @@ window.VAZ = window.VAZ || {};
       /* --- столкновения --- */
       const hitB = this.world.resolveBuildings(c);
       const hitT = this.world.resolveTraffic(c);
+      const hitPed = this.world.resolvePedestrians(c);
       const hit = Math.max(hitB, hitT);
+      if (hitPed > 1.2) {
+        this.renderer.shake(0.12);
+        VAZ.audio.click();
+      }
       if (hit > 2.2) {
         const k = clamp(hit / 16, 0.12, 1);
         this.renderer.shake(k * 0.9);
