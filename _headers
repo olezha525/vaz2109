@@ -1,0 +1,12 @@
+/*
+  Cache-Control: no-cache
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/VAZ-2109-Setup.exe
+  Content-Disposition: attachment
+  Cache-Control: no-cache
+
+/game.html
+  Cache-Control: no-cache
