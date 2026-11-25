@@ -175,6 +175,14 @@
   .shot figcaption b{display:block;color:var(--amber2);font-size:8.5px;letter-spacing:.24em;margin-bottom:3px;font-weight:400}
   .s1,.s2,.s3,.s4{grid-column:auto}
 
+  /* ---------- video ---------- */
+  .video-frame{position:relative;max-width:1000px;margin:0 auto;border-radius:16px;overflow:hidden;
+    border:1px solid var(--line2);background:#000;box-shadow:0 30px 80px rgba(0,0,0,.55)}
+  .video-frame video{display:block;width:100%;height:auto;aspect-ratio:16/9;background:#000}
+  .video-meta{display:flex;justify-content:space-between;gap:16px;max-width:1000px;margin:14px auto 0;
+    font-size:9.5px;letter-spacing:.18em;color:var(--muted2);text-transform:uppercase}
+  .video-meta b{color:var(--amber2);font-weight:400}
+
   /* ---------- controls ---------- */
   .controls-grid{display:grid;grid-template-columns:1.08fr .92fr;gap:clamp(24px,4vw,54px);align-items:center}
   .keys{display:grid;grid-template-columns:1fr 1fr;gap:10px 26px}
@@ -298,6 +306,7 @@
     <nav class="nav-links" aria-label="Разделы">
       <a href="#features">Возможности</a>
       <a href="#views">Виды</a>
+      <a href="#video">Видео</a>
       <a href="#controls">Управление</a>
       <a href="#download">Скачать</a>
       <a href="#faq">Вопросы</a>
@@ -308,6 +317,7 @@
   <div class="wrap nav-mobile" id="navMobile">
     <a href="#features">Возможности</a>
     <a href="#views">Виды</a>
+    <a href="#video">Видео</a>
     <a href="#controls">Управление</a>
     <a href="#download">Скачать</a>
     <a href="#faq">Вопросы</a>
@@ -338,7 +348,7 @@
         </div>
         <div class="hero-meta">
           <span><i></i> Без установки в браузере</span>
-          <span>≈ 214 КБ · Windows 10/11</span>
+          <span>≈ 231 КБ · Windows 10/11</span>
           <span>Звук после первого клика</span>
         </div>
         <div class="stats">
@@ -442,6 +452,27 @@
     </div>
   </section>
 
+  <section class="sec" id="video" style="padding-top:0">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="eyebrow">Видео</div>
+        <h2>Пятнадцать секунд <em>в городе</em></h2>
+        <p>Ночная улица, пешеходы и светофоры, приборка и вид сверху. Короткий ролик о том, как выглядит поездка.</p>
+      </div>
+      <div class="video-frame reveal">
+        <video controls playsinline preload="metadata" poster="assets/promo-poster.jpg" width="1280" height="720">
+          <source src="assets/promo.mp4" type="video/mp4">
+          <source src="https://vaz2109.netlify.app/assets/promo.mp4" type="video/mp4">
+          Ваш браузер не поддерживает встроенное видео.
+        </video>
+      </div>
+      <div class="video-meta reveal">
+        <span>15 секунд · 1280×720 · H.264</span>
+        <span><b>Со звуком</b> — включите его на панели плеера</span>
+      </div>
+    </div>
+  </section>
+
   <section class="sec" id="controls" style="padding-top:0">
     <div class="wrap controls-grid">
       <div>
@@ -482,13 +513,13 @@
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8m-4-4v4"/></svg> Установщик для Windows</h3>
             <p>Окно мастера: выбор папки, ярлыки на рабочем столе и в «Пуске», удаление через «Параметры → Приложения».</p>
             <a class="btn btn-primary" href="VAZ-2109-Setup.exe?v=2" download>Скачать установщик</a>
-            <div class="dl-size"><span>VAZ-2109-Setup.exe</span><span>≈ 221 КБ</span></div>
+            <div class="dl-size"><span>VAZ-2109-Setup.exe</span><span>≈ 225 КБ</span></div>
           </div>
           <div class="dl-card">
             <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8"/><path d="M3 12h18M12 4a14 14 0 0 1 0 16M12 4a14 14 0 0 0 0 16"/></svg> Прямо в браузере</h3>
             <p>Один файл со всей игрой. Открывается офлайн, работает в Edge, Chrome, Firefox и на телефоне.</p>
             <a class="btn btn-ghost" href="game.html?v=2">Открыть игру</a>
-            <div class="dl-size"><span><a href="game.html?v=2" download style="color:var(--muted)">Скачать HTML-файл</a></span><span>≈ 214 КБ</span></div>
+            <div class="dl-size"><span><a href="game.html?v=2" download style="color:var(--muted)">Скачать HTML-файл</a></span><span>≈ 231 КБ</span></div>
           </div>
         </div>
         <div class="dl-note">Установщик не подписан цифровой подписью: Windows SmartScreen может предупредить. Нажмите <b style="color:#d9d2c4">«Подробнее» → «Выполнить всё равно»</b>. Это нормально для небольшой бесплатной игры.</div>
