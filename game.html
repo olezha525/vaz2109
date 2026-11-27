@@ -3215,10 +3215,11 @@ window.VAZ = window.VAZ || {};
       });
       if (!roads.length) return;
       let road = null, s = 0, pos = null;
-      for (let attempt = 0; attempt < 10; attempt++) {
+      for (let attempt = 0; attempt < 12; attempt++) {
         const cand = roads[Math.floor(Math.random() * roads.length)];
         const total = polylineLength(cand.pts);
         const cs = Math.random() * total;
+        if (!cand.loop && (cs < 30 || cs > total - 30)) continue;
         const p = pointOnPolyline(cand.pts, cs, cand.loop);
         const d = Math.hypot(p.x - playerX, p.y - playerY);
         if (d >= 60 && d <= radius) { road = cand; s = cs; pos = p; break; }
@@ -3230,13 +3231,24 @@ window.VAZ = window.VAZ || {};
       else if (r > 0.85) type = 'van';
       const len = type === 'truck' ? 9.2 : type === 'van' ? 5.2 : 4.35;
       const wid = type === 'truck' ? 2.5 : type === 'van' ? 2.05 : 1.72;
-      const speed = type === 'truck' ? U.rand(13, 18) : type === 'van' ? U.rand(15, 21) : U.rand(17, 27);
+      let speed;
+      if (road.type === 'highway') {
+        speed = type === 'truck' ? U.rand(16, 21) : type === 'van' ? U.rand(20, 26) : U.rand(23, 31);
+      } else if (road.type === 'ring') {
+        speed = type === 'truck' ? U.rand(10, 14) : type === 'van' ? U.rand(13, 18) : U.rand(14, 20);
+      } else {
+        speed = type === 'truck' ? U.rand(8, 12) : type === 'van' ? U.rand(10, 15) : U.rand(11, 17);
+      }
       const dir = road.type === 'ring' ? 1 : Math.random() < 0.5 ? 1 : -1;
-      const lane = road.type === 'ring' ? 4.2 : 3.1;
+      const lane = Math.max(2.2, road.width * 0.27);
       const car = {
-        x: pos.x, y: pos.y, h: pos.h, s, road, dir, type, len, wid,
+        x: pos.x - Math.sin(pos.h) * dir * lane,
+        y: pos.y + Math.cos(pos.h) * dir * lane,
+        h: pos.h + (dir < 0 ? Math.PI : 0),
+        s, road, dir, type, len, wid,
         speed, baseSpeed: speed, lane, color: pick(CAR_COLORS),
         brake: 0, passed: false, horn: 0, wobble: Math.random() * 10, avoid: 0,
+        total: polylineLength(road.pts),
       };
       this.traffic.push(car);
     }
@@ -3256,8 +3268,11 @@ window.VAZ = window.VAZ || {};
           const dx = o.x - pos.x, dy = o.y - pos.y;
           const ahead = dx * hx + dy * hy;
           const side = Math.abs(dx * -hy + dy * hx);
-          if (ahead > 0 && ahead < 16 + c.len * 0.5 && side < 2.6) {
-            target = Math.min(target, o.speed * 0.85);
+          const safeGap = (c.len + o.len) * 0.5 + 1.2;
+          const gap = safeGap + 8 + c.speed * 1.2;
+          if (ahead > 0 && ahead < gap && side < 2.5) {
+            const safe = Math.max(0, (ahead - safeGap) / 1.8);
+            target = Math.min(target, Math.min(o.speed, safe));
           }
         }
         const pdx = px - pos.x, pdy = py - pos.y;
@@ -3265,13 +3280,14 @@ window.VAZ = window.VAZ || {};
         const pLat = pdx * -hy + pdy * hx;
         const pSide = Math.abs(pLat);
         let avoidTarget = 0;
-        if (pAhead > 0 && pAhead < 20 && pSide < 3.4) {
+        if (pAhead > 2.5 && pAhead < 20 && pSide < 2.7) {
+          const safe = Math.max(0, (pAhead - 5.2) / 1.7);
           if (playerSpeed < 3) {
             // объезжаем стоящего
             avoidTarget = (pLat > 0 ? -1 : 1) * 3.4;
-            target = Math.min(target, 5);
+            target = Math.min(target, 4, safe);
           } else {
-            target = Math.min(target, Math.max(4, playerSpeed * 0.8));
+            target = Math.min(target, Math.min(playerSpeed, safe));
           }
         }
         c.avoid = U.damp(c.avoid, avoidTarget, 1.8, dt);
@@ -3283,19 +3299,30 @@ window.VAZ = window.VAZ || {};
           const lat = Math.abs(lx * -hy + ly * hx);
           if (lat > c.road.width * 0.85) continue;
           const state = c.road.type === 'ring' ? l.ring : c.road.type === 'street' ? l.spoke : 'green';
-          if (state === 'red' || (state === 'yellow' && ahead < 11)) {
-            target = 0;
-            break;
+          if (state === 'red' || (state === 'yellow' && ahead < 15)) {
+            // плавно тормозим к стоп-линии, не встаём за 20 метров
+            const stopAhead = Math.max(4, Math.abs(c.speed) * 1.1 + 4);
+            if (ahead < stopAhead) {
+              target = Math.min(target, Math.max(0, (ahead - 2) * 1.1));
+            }
           }
         }
         // если прижались к борту — возвращаемся плавнее
         c.speed = U.damp(c.speed, target, target < c.speed ? 2.4 : 0.9, dt);
         c.s += c.speed * dt;
+        const total = c.total || polylineLength(c.road.pts);
+        if (c.road.loop) {
+          c.s = ((c.s % total) + total) % total;
+        } else if (c.s > total - 2 || c.s < 2) {
+          // не скапливаемся в тупиках: машина уходит с конца дороги
+          cars.splice(i, 1);
+          continue;
+        }
         const np = pointOnPolyline(c.road.pts, c.s, c.road.loop);
         // смещение в правую полосу (+ объезд)
         const rightX = -Math.sin(np.h) * c.dir;
         const rightY = Math.cos(np.h) * c.dir;
-        const off = c.lane * 0.5 + c.avoid;
+        const off = c.lane + c.avoid;
         c.x = np.x + rightX * off;
         c.y = np.y + rightY * off;
         c.h = np.h;
@@ -5132,6 +5159,8 @@ window.VAZ = window.VAZ || {};
         const top = this.project(p.x, 7.2, p.y);
         if (!base || !top) return;
         const s = base.s;
+        // слишком близко к камере — не рисуем огромный плафон
+        if (s > 200) return;
         const nx = p.nx || 0;
         const ny = p.ny || 0;
         const side = p.side || 1;
@@ -5154,8 +5183,8 @@ window.VAZ = window.VAZ || {};
           ctx.lineTo(arm.x, arm.y);
           ctx.stroke();
 
-          const lw = Math.max(4, 0.55 * s);
-          const lh = Math.max(2.5, 0.18 * s);
+          const lw = Math.min(80, Math.max(4, 0.55 * s));
+          const lh = Math.min(26, Math.max(2.5, 0.18 * s));
           ctx.fillStyle = '#20252b';
           ctx.fillRect(arm.x - lw / 2, arm.y - lh / 2, lw, lh);
           ctx.fillStyle = night > 0.25 ? 'rgba(255,226,160,0.95)' : '#d8d2be';
@@ -5408,7 +5437,7 @@ window.VAZ = window.VAZ || {};
         const ly = p.lampY !== undefined ? p.lampY : p.y;
         const q = this.project(lx, 0.1, ly);
         if (!q) continue;
-        const rad = Math.max(14, 11 * q.s);
+        const rad = Math.min(80, Math.max(14, 11 * q.s));
         const g = ctx.createRadialGradient(q.x, q.y, 0, q.x, q.y, rad);
         g.addColorStop(0, `rgba(255,205,140,${0.24 * night})`);
         g.addColorStop(0.5, `rgba(255,185,100,${0.09 * night})`);
