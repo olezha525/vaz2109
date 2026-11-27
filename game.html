@@ -2686,6 +2686,37 @@ window.VAZ = window.VAZ || {};
 
   const seeded = (gi, gj) => Math.floor(hash(gi * 127.13 + gj * 311.71 + 4.37) * 1e9);
 
+  function freeSpot(city, x, y, own, pad) {
+    if (!city) return true;
+    for (const r of city.roads) {
+      if (r === own) continue;
+      if (distToPolyline(x, y, r.pts) < r.width * 0.5 + pad) return false;
+    }
+    for (const b of city.buildings) {
+      if (Math.hypot(b.x - x, b.y - y) < Math.max(b.w, b.d) * 0.5 + pad) return false;
+    }
+    if (city.gas && Math.hypot(city.gas.x - x, city.gas.y - y) < city.gas.r + pad) return false;
+    if (city.lights) {
+      for (const l of city.lights) {
+        if (Math.hypot(l.x - x, l.y - y) < 6 + pad) return false;
+        const lpx = l.x + Math.cos(l.a) * 8.5;
+        const lpy = l.y + Math.sin(l.a) * 8.5;
+        if (Math.hypot(lpx - x, lpy - y) < 4 + pad) return false;
+      }
+    }
+    if (city.exits) {
+      for (const ex of city.exits) {
+        const dx = x - city.x, dy = y - city.y;
+        const along = dx * Math.cos(ex.a) + dy * Math.sin(ex.a);
+        if (along > city.r - 14) {
+          const lat = Math.abs(dx * -Math.sin(ex.a) + dy * Math.cos(ex.a));
+          if (lat < 9 + pad) return false;
+        }
+      }
+    }
+    return true;
+  }
+
   function makeCity(gi, gj) {
     const rng = mulberry32(seeded(gi, gj));
     const rand = (a, b) => a + rng() * (b - a);
@@ -2800,23 +2831,31 @@ window.VAZ = window.VAZ || {};
     }
 
     /* --- парки и деревья --- */
-    for (let i = 0; i < 12; i++) {
+    let placedTrees = 0;
+    for (let attempt = 0; attempt < 90 && placedTrees < 10; attempt++) {
       const a = rng() * TAU;
-      const rr = rand(30, r - 16);
+      const rr = rand(30, r - 18);
       const px = x + Math.cos(a) * rr;
       const py = y + Math.sin(a) * rr;
-      if (city.buildings.some((b) => Math.hypot(b.x - px, b.y - py) < 14)) continue;
+      if (!freeSpot(city, px, py, null, 3.2)) continue;
+      if (city.props.some((p) => Math.hypot(p.x - px, p.y - py) < 7)) continue;
       city.props.push({ x: px, y: py, r: rand(2.6, 4.6), kind: rng() < 0.7 ? 'tree' : 'bush' });
+      placedTrees++;
     }
-    for (let i = 0; i < 14; i++) {
+    let placedOuter = 0;
+    for (let attempt = 0; attempt < 80 && placedOuter < 14; attempt++) {
       const a = rng() * TAU;
-      const rr = r + rand(14, 52);
+      const rr = r + rand(16, 56);
+      const px = x + Math.cos(a) * rr;
+      const py = y + Math.sin(a) * rr;
+      if (!freeSpot(city, px, py, null, 4)) continue;
       city.props.push({
-        x: x + Math.cos(a) * rr,
-        y: y + Math.sin(a) * rr,
+        x: px,
+        y: py,
         r: rand(2.4, 4.4),
         kind: rng() < 0.75 ? 'tree' : 'bush',
       });
+      placedOuter++;
     }
 
     /* --- АЗС у кольца --- */
@@ -2978,27 +3017,45 @@ window.VAZ = window.VAZ || {};
     if (rd._props) return rd._props;
     const props = [];
     const total = polylineLength(rd.pts);
-    const step = rd.type === 'highway' ? 26 : 30;
-    for (let s = 4; s < total; s += step) {
+    const highway = rd.type === 'highway';
+    const step = highway ? 30 : 26;
+    let i = 0;
+
+    for (let s = 8; s < total - 8; s += step, i++) {
       const p = pointOnPolyline(rd.pts, s, rd.loop);
       const nx = -Math.sin(p.h), ny = Math.cos(p.h);
-      for (const side of [-1, 1]) {
-        const h0 = hash(s * 0.37 + side * 7.1 + rd.pts[0][0] * 0.11 + rd.pts[0][1] * 0.07);
-        if (h0 < 0.34) continue;
-        const off = rd.width * 0.5 + 2.6 + h0 * 5.5;
-        let kind = 'tree';
-        if (h0 < 0.46) kind = 'pole';
-        else if (h0 > 0.82) kind = 'bush';
+      const side = i % 2 === 0 ? 1 : -1;
+
+      // фонарь: столб у бордюра, консоль с лампой над дорогой
+      const loff = rd.width * 0.5 + (highway ? 2.0 : 1.4);
+      const lx = p.x + nx * loff * side;
+      const ly = p.y + ny * loff * side;
+      if (freeSpot(rd.city, lx, ly, rd, 1.2)) {
+        const arm = 2.4;
         props.push({
-          x: p.x + nx * off * side,
-          y: p.y + ny * off * side,
-          r: 2.1 + h0 * 2.1,
-          kind,
-          a: p.h,
+          kind: 'pole',
+          x: lx, y: ly, a: p.h, side, nx, ny,
+          lampX: lx - nx * arm * side,
+          lampY: ly - ny * arm * side,
+          lampH: 7.0,
+          r: 0.22,
+        });
+      }
+
+      // дерево/куст на противоположной стороне тротуара
+      const toff = rd.width * 0.5 + (rd.type === 'ring' ? 5.0 : highway ? 6.4 : 4.7) + (i % 3) * 0.6;
+      const tx = p.x - nx * toff * side;
+      const ty = p.y - ny * toff * side;
+      if (freeSpot(rd.city, tx, ty, rd, 1.3)) {
+        const h0 = hash(s * 0.37 + rd.pts[0][0] * 0.11 + rd.pts[0][1] * 0.07);
+        props.push({
+          kind: h0 < 0.24 ? 'bush' : 'tree',
+          x: tx, y: ty, r: 2.0 + h0 * 2.0, a: p.h, side: -side, nx, ny,
         });
       }
     }
-    if (rd.type === 'highway') {
+
+    if (highway) {
       for (let s = 40; s < total - 40; s += 130) {
         const h0 = hash(s * 0.13 + rd.pts[0][0] * 0.7);
         if (h0 > 0.5) continue;
@@ -3819,23 +3876,30 @@ window.VAZ = window.VAZ || {};
         if (!visible(p.x, p.y, 26)) continue;
         const r = p.r;
         if (p.kind === 'pole') {
+          const nx = p.nx || 0;
+          const ny = p.ny || 0;
+          const side = p.side || 1;
+          const ax = p.lampX !== undefined ? p.lampX : p.x - nx * 2.4 * side;
+          const ay = p.lampY !== undefined ? p.lampY : p.y - ny * 2.4 * side;
           ctx.fillStyle = 'rgba(8,10,8,0.28)';
           ctx.beginPath();
-          ctx.arc(p.x + 0.9, p.y + 1.1, 0.9, 0, TAU);
+          ctx.arc(p.x + 0.5, p.y + 0.6, 0.75, 0, TAU);
           ctx.fill();
-          ctx.fillStyle = '#6f7370';
+          ctx.fillStyle = '#6b7178';
           ctx.beginPath();
-          ctx.arc(p.x, p.y, 0.55, 0, TAU);
+          ctx.arc(p.x, p.y, 0.3, 0, TAU);
           ctx.fill();
-          ctx.strokeStyle = '#4b4f4b';
-          ctx.lineWidth = 0.35;
+          ctx.strokeStyle = '#3d444b';
+          ctx.lineWidth = 0.22;
           ctx.beginPath();
           ctx.moveTo(p.x, p.y);
-          ctx.lineTo(p.x + Math.cos(p.a + Math.PI / 2) * 2.4, p.y + Math.sin(p.a + Math.PI / 2) * 2.4);
+          ctx.lineTo(ax, ay);
           ctx.stroke();
-          ctx.fillStyle = '#e8dfc6';
+          ctx.fillStyle = '#20252b';
+          ctx.fillRect(ax - 0.35, ay - 0.18, 0.7, 0.36);
+          ctx.fillStyle = '#ffe2a0';
           ctx.beginPath();
-          ctx.arc(p.x + Math.cos(p.a + Math.PI / 2) * 2.4, p.y + Math.sin(p.a + Math.PI / 2) * 2.4, 0.42, 0, TAU);
+          ctx.arc(ax, ay, 0.4, 0, TAU);
           ctx.fill();
           continue;
         }
@@ -4336,13 +4400,15 @@ window.VAZ = window.VAZ || {};
       for (const p of st.world.nearProps) {
         if (p.kind !== 'pole') continue;
         if (p.x < x0 || p.x > x1 || p.y < y0 || p.y > y1) continue;
-        const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, 16);
+        const px = p.lampX !== undefined ? p.lampX : p.x;
+        const py = p.lampY !== undefined ? p.lampY : p.y;
+        const g = ctx.createRadialGradient(px, py, 0, px, py, 16);
         g.addColorStop(0, `rgba(255,210,145,${0.22 * night})`);
         g.addColorStop(0.4, `rgba(255,185,100,${0.08 * night})`);
         g.addColorStop(1, 'rgba(255,170,80,0)');
         ctx.fillStyle = g;
         ctx.beginPath();
-        ctx.arc(p.x, p.y, 16, 0, TAU);
+        ctx.arc(px, py, 16, 0, TAU);
         ctx.fill();
       }
 
@@ -4566,7 +4632,7 @@ window.VAZ = window.VAZ || {};
       const green = ['#2f4a2b', '#36552f', '#2a4527'][v];
       const light = ['#4a6d3c', '#557a45', '#3f6236'][v];
       g.fillStyle = '#3a2c22';
-      g.fillRect(45, 96, 7, 40);
+      g.fillRect(45, 96, 7, 44);
       const blobs = [
         [48, 46, 34], [28, 70, 24], [68, 66, 26], [48, 82, 22], [48, 24, 20],
       ];
@@ -5063,18 +5129,48 @@ window.VAZ = window.VAZ || {};
       }
       if (p.kind === 'pole') {
         const base = this.project(p.x, 0, p.y);
-        const top = this.project(p.x, 8.5, p.y);
+        const top = this.project(p.x, 7.2, p.y);
         if (!base || !top) return;
-        ctx.strokeStyle = '#4c504c';
-        ctx.lineWidth = Math.max(1, 0.22 * base.s);
+        const s = base.s;
+        const nx = p.nx || 0;
+        const ny = p.ny || 0;
+        const side = p.side || 1;
+        const ax = p.lampX !== undefined ? p.lampX : p.x - nx * 2.4 * side;
+        const ay = p.lampY !== undefined ? p.lampY : p.y - ny * 2.4 * side;
+        const arm = this.project(ax, 6.95, ay);
+
+        ctx.lineCap = 'round';
+        ctx.strokeStyle = '#3d444b';
+        ctx.lineWidth = Math.max(1, 0.16 * s);
         ctx.beginPath();
         ctx.moveTo(base.x, base.y);
         ctx.lineTo(top.x, top.y);
         ctx.stroke();
-        ctx.fillStyle = night > 0.3 ? '#ffe0a0' : '#cfc9b2';
-        ctx.beginPath();
-        ctx.arc(top.x, top.y, Math.max(1.2, 0.3 * top.s), 0, TAU);
-        ctx.fill();
+
+        if (arm) {
+          ctx.lineWidth = Math.max(1, 0.1 * s);
+          ctx.beginPath();
+          ctx.moveTo(top.x, top.y);
+          ctx.lineTo(arm.x, arm.y);
+          ctx.stroke();
+
+          const lw = Math.max(4, 0.55 * s);
+          const lh = Math.max(2.5, 0.18 * s);
+          ctx.fillStyle = '#20252b';
+          ctx.fillRect(arm.x - lw / 2, arm.y - lh / 2, lw, lh);
+          ctx.fillStyle = night > 0.25 ? 'rgba(255,226,160,0.95)' : '#d8d2be';
+          ctx.fillRect(arm.x - lw * 0.42, arm.y + lh * 0.35, lw * 0.84, Math.max(1, lh * 0.45));
+
+          if (night > 0.25) {
+            ctx.shadowColor = 'rgba(255,205,120,0.9)';
+            ctx.shadowBlur = Math.min(18, 0.8 * s);
+            ctx.fillStyle = 'rgba(255,220,150,0.85)';
+            ctx.beginPath();
+            ctx.arc(arm.x, arm.y + lh, Math.max(1.6, 0.16 * s), 0, TAU);
+            ctx.fill();
+            ctx.shadowBlur = 0;
+          }
+        }
         return;
       }
       if (p.kind === 'house') {
@@ -5308,7 +5404,9 @@ window.VAZ = window.VAZ || {};
         if (p.kind !== 'pole') continue;
         const d = Math.hypot(p.x - this.cam.x, p.y - this.cam.z);
         if (d > 90) continue;
-        const q = this.project(p.x, 0.1, p.y);
+        const lx = p.lampX !== undefined ? p.lampX : p.x;
+        const ly = p.lampY !== undefined ? p.lampY : p.y;
+        const q = this.project(lx, 0.1, ly);
         if (!q) continue;
         const rad = Math.max(14, 11 * q.s);
         const g = ctx.createRadialGradient(q.x, q.y, 0, q.x, q.y, rad);
