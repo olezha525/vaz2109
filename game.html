@@ -5839,7 +5839,7 @@ window.VAZ = window.VAZ || {};
     _makeCar() {
       return {
         x: 0, y: 0, h: 0, vx: 0, vy: 0,
-        speed: 0, vL: 0, steer: 0, yaw: 0,
+        speed: 0, vL: 0, steer: 0, steerInput: 0, yaw: 0,
         rpm: 0, throttle: 0, gear: 1,
         engineOn: false, ignition: 0, electric: false,
         fuel: 31.5, temp: 22, damage: 0,
@@ -5857,7 +5857,7 @@ window.VAZ = window.VAZ || {};
       c.x = city.x + Math.cos(ang) * (city.r * 0.8);
       c.y = city.y + Math.sin(ang) * (city.r * 0.8);
       c.h = ang + Math.PI;
-      c.vx = 0; c.vy = 0; c.speed = 0; c.vL = 0; c.steer = 0; c.yaw = 0;
+      c.vx = 0; c.vy = 0; c.speed = 0; c.vL = 0; c.steer = 0; c.steerInput = 0; c.yaw = 0;
       if (!initial) {
         c.damage = Math.max(0, c.damage - 8);
       }
@@ -6544,7 +6544,7 @@ window.VAZ = window.VAZ || {};
         else throttleTarget = gasIn * (brakeIn ? 0.15 : 1);
         if (this.shiftCut > 0) throttleTarget *= 0.15;
       }
-      c.throttle = damp(c.throttle, throttleTarget, 9, dt);
+      c.throttle = damp(c.throttle, throttleTarget, 7.5, dt);
 
       /* --- обороты --- */
       if (c.engineOn) {
@@ -6574,7 +6574,7 @@ window.VAZ = window.VAZ || {};
 
       /* --- статус покрытия (не каждый шаг) --- */
       this.surfaceTimer = (this.surfaceTimer || 0) - dt;
-      if (this.surfaceTimer <= 0 || this.onRoad === undefined) {
+      if (this.surfaceTimer <= 0) {
         this.surfaceTimer = 0.08;
         c.onRoad = this.world.surfaceAt(c.x, c.y) === 'asphalt';
       }
@@ -6589,7 +6589,7 @@ window.VAZ = window.VAZ || {};
       if (c.engineOn) {
         const tq = torqueCurve(c.rpm / MAX_RPM);
         const dir = c.gear === -1 ? -1 : 1;
-        accel = dir * c.throttle * 6.2 * tq * gearTorque * damageFactor * surfaceGrip;
+        accel = dir * c.throttle * 5.6 * tq * gearTorque * damageFactor * surfaceGrip;
         // отсечка
         if (c.rpm > MAX_RPM - 120) accel *= 0.15;
         if (c.rpm < 500) accel *= 0.3;
@@ -6599,9 +6599,13 @@ window.VAZ = window.VAZ || {};
       const drag = 0.00092 * vF * Math.abs(vF) * (onRoad ? 1 : 1.5);
       const roll = (0.42 + Math.abs(vF) * 0.012) * surfaceRoll;
       accel -= drag + Math.sign(vF) * roll;
+      // торможение двигателем при сбросе газа
+      if (c.engineOn && c.throttle < 0.05 && c.gear > 0 && Math.abs(vF) > 1) {
+        accel -= Math.sign(vF) * 0.45;
+      }
 
       // тормоз
-      const brakePower = 9.5 * surfaceGrip;
+      const brakePower = 8.2 * surfaceGrip;
       let braking = 0;
       if (i.brake > 0.1 && c.gear !== -1) {
         if (vF > 0.3) braking = brakePower * i.brake;
@@ -6618,24 +6622,28 @@ window.VAZ = window.VAZ || {};
       if (Math.abs(vF) < 0.25 && c.throttle < 0.02 && braking > 0) vF = 0;
 
       vF += accel * dt;
+      if (c.gear === -1 && vF < -9) vF = -9;
       if (braking > 0 && Math.sign(vF) !== Math.sign(vF - accel * dt) && Math.abs(vF) < 0.9) vF = 0;
 
       // боковая устойчивость
-      let grip = (onRoad ? 8.2 : 4.6) * surfaceGrip;
+      let grip = (onRoad ? 7.4 : 4.4) * surfaceGrip;
       if (i.hand > 0.1) grip *= 0.26;
-      if (Math.abs(vF) > 30) grip *= 0.82;
+      if (Math.abs(vF) > 30) grip *= 0.88;
       vL *= Math.exp(-grip * dt);
 
-      // поворот
-      const steerMax = 0.55 * (1 - clamp(Math.abs(vF) / 46, 0, 0.55));
-      const steerTarget = i.steer * steerMax;
-      c.steer = damp(c.steer, steerTarget, 10, dt);
-      const yawRate = (vF / 2.46) * Math.tan(c.steer) * 0.62;
+      // поворот: плавный ввод и ограничение по сцеплению
+      const steerMax = 0.5 / (1 + Math.abs(vF) * 0.045);
+      c.steerInput = damp(c.steerInput, i.steer, 5.5, dt);
+      c.steer = damp(c.steer, c.steerInput * steerMax, 14, dt);
+      const yawDesired = (vF / 2.46) * Math.tan(c.steer);
+      const gripLimit = onRoad ? 8.6 : 4.4;
+      const yawMax = gripLimit / Math.max(4, Math.abs(vF));
+      const yawRate = clamp(yawDesired, -yawMax, yawMax);
       c.yaw = yawRate;
       c.h += yawRate * dt;
 
       // центробежный снос
-      vL -= yawRate * vF * 0.12 * dt * (onRoad ? 1 : 1.4);
+      vL -= yawRate * vF * 0.09 * dt * (onRoad ? 1 : 1.35);
 
       // обратно в мировые координаты
       const nfx = Math.cos(c.h), nfy = Math.sin(c.h);
